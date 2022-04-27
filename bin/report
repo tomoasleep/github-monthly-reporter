@@ -1,0 +1,309 @@
+#!/usr/bin/env ruby
+
+# Usage: ruby gh-monthly-report.rb <year> <month> <organization name>
+
+require 'bundler/inline'
+
+gemfile do
+  source 'https://rubygems.org'
+  gem 'graphql-client'
+end
+
+require 'graphql/client'
+require 'graphql/client/http'
+require 'erb'
+require 'date'
+require 'time'
+require 'open-uri'
+
+GITHUB_ACCESS_TOKEN = ENV.fetch('GITHUB_ACCESS_TOKEN')
+
+HTTP = GraphQL::Client::HTTP.new('https://api.github.com/graphql') do
+  def headers(context)
+    { Authorization: "bearer #{GITHUB_ACCESS_TOKEN}" }
+  end
+end
+
+schema_json = URI.parse("https://api.github.com/graphql").read("Authorization" => "bearer #{GITHUB_ACCESS_TOKEN}")
+Schema = GraphQL::Client.load_schema(schema_json)
+Client = GraphQL::Client.new(schema: Schema, execute: HTTP)
+
+from_time = Time.new(ARGV.fetch(0), ARGV.fetch(1))
+to_time = from_time.to_datetime.next_month.to_time
+
+organization_name = ARGV.fetch(2)
+
+class QueryError < StandardError; end
+
+def query(query_string, **variables)
+  res = Client.query(query_string, variables: variables)
+  fail(QueryError, res.errors.messages.values.flatten.join("\n")) unless res.errors.empty?
+  res
+end
+
+OrganizationQuery = Client.parse <<~'GRAPHQL'
+  query ($organizationName: String!) {
+    organization(login: $organizationName) {
+      id
+    }
+  }
+GRAPHQL
+
+organization_result = query(OrganizationQuery, organizationName: organization_name)
+organization_id = organization_result.data.organization.id
+
+ContributionsQuery = Client.parse <<~'GRAPHQL'
+  query ($from_at: DateTime!, $to_at: DateTime!, $organization_id: ID!) {
+    viewer {
+      contributionsCollection(from: $from_at, to: $to_at, organizationID: $organization_id) {
+        pullRequestContributionsByRepository(maxRepositories: 25) {
+          repository {
+            resourcePath
+            owner {
+              login
+            }
+          }
+          contributions(first: 50) {
+            totalCount
+            nodes {
+              pullRequest {
+                repository {
+                  resourcePath
+                }
+                title
+                resourcePath
+                number
+                state
+                projectCards(first: 5) {
+                  nodes {
+                    project {
+                      name
+                      resourcePath
+                      url
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        pullRequestReviewContributionsByRepository(maxRepositories: 25) {
+          repository {
+            resourcePath
+            owner {
+              login
+            }
+          }
+          contributions(first: 50) {
+            totalCount
+            nodes {
+              pullRequest {
+                repository {
+                  resourcePath
+                }
+                title
+                resourcePath
+                number
+                state
+                projectCards(first: 5) {
+                  nodes {
+                    project {
+                      name
+                      resourcePath
+                      url
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        issueContributionsByRepository(maxRepositories: 25) {
+          repository {
+            resourcePath
+            owner {
+              login
+            }
+          }
+          contributions(first: 50) {
+            totalCount
+            nodes {
+              issue {
+                repository {
+                  resourcePath
+                }
+                title
+                resourcePath
+                number
+                state
+                projectCards(first: 5) {
+                  nodes {
+                    project {
+                      name
+                      resourcePath
+                      url
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+GRAPHQL
+
+IssueCommentsQuery = Client.parse <<~'GRAPHQL'
+  query ($before_cursor: String) {
+    viewer {
+      issueComments(before: $before_cursor, last: 100) {
+        totalCount
+        pageInfo {
+          hasPreviousPage
+          startCursor
+          endCursor
+        }
+        edges {
+          cursor
+          node {
+            createdAt
+            resourcePath
+            url
+            issue {
+              repository {
+                resourcePath
+                owner {
+                  login
+                }
+              }
+              projectCards(first: 5) {
+                nodes {
+                  project {
+                    name
+                    resourcePath
+                    url
+                  }
+                }
+              }
+              resourcePath
+              url
+              number
+              state
+              title
+            }
+          }
+        }
+      }
+    }
+    rateLimit {
+      cost
+      limit
+      remaining
+    }
+  }
+GRAPHQL
+
+def query_issue_comments(after:, organization_name:)
+  enumerator = Enumerator.new do |yielder|
+    cursor = nil
+    begin
+      result = query(IssueCommentsQuery, before_cursor: cursor)
+      cursor = result.data.viewer.issue_comments.page_info.start_cursor
+      # puts "cursor: #{cursor}, rate limit: #{result.data.rate_limit.remaining}"
+      result.data.viewer.issue_comments.edges.map(&:node).select { |node| node.issue.repository.owner.login == organization_name }.sort_by { |node| Time.parse(node.created_at) }.reverse.each { |node| yielder << node }
+    end while cursor
+  end
+
+  enumerator.take_while { |node| Time.parse(node.created_at) > after }
+end
+
+contributions_result = query(ContributionsQuery, from_at: from_time.iso8601, to_at: to_time.iso8601, organization_id: organization_id )
+issue_comment_nodes = query_issue_comments(after: from_time, organization_name: organization_name).reverse
+
+def github_url(resource_path)
+  "https://github.com/#{resource_path.delete_prefix('/')}"
+end
+
+def resource_name(resource_path)
+  resource_path.delete_prefix('/')
+end
+
+def pr_or_issue_link(resource)
+  prefix = case resource.state
+           when 'MERGED'
+             ':white_check_mark: '
+           when 'CLOSED'
+             ':white_check_mark: '
+           else
+             ':tangerine: '
+           end
+  "#{prefix}[#{resource.title} - #{resource_name(resource.repository.resource_path)}##{resource.number}](#{github_url(resource.resource_path)})"
+end
+
+def group_issue_comments_by_repository(nodes)
+  nodes.group_by { |node| node.issue.repository.resource_path }.transform_values { |nodes| nodes.uniq { |node| node.issue.resource_path } }
+end
+
+def group_issue_comments_by_project(nodes)
+  nodes
+    .flat_map { |node| 
+      if node.issue.project_cards.nodes.empty? 
+        [[[nil, 'No Project'], node]]
+      else
+        node.issue.project_cards.nodes.map { |project_card| [[project_card.project.resource_path, project_card.project.name], node] }
+      end
+    }
+    .group_by { |pair| pair.first }.transform_values { |pairs| pairs.map(&:last).uniq { |node| node.issue.resource_path } }
+    .sort_by { |((resource_path, _name), _value)| resource_path || '0 to make nil last' }.to_h
+end
+
+organization_pull_request_contributions = contributions_result.data.viewer.contributions_collection.pull_request_contributions_by_repository.select { |rep| rep.repository.owner.login == organization_name }
+organization_review_contributions = contributions_result.data.viewer.contributions_collection.pull_request_review_contributions_by_repository.select { |rep| rep.repository.owner.login == organization_name }
+organization_issue_contributions = contributions_result.data.viewer.contributions_collection.issue_contributions_by_repository.select { |rep| rep.repository.owner.login == organization_name }
+
+template = <<~ERB
+  ## Pull Requests
+  <%- organization_pull_request_contributions.each do |rep| -%>
+  - [<%= resource_name(rep.repository.resource_path) %>](<%= github_url(rep.repository.resource_path) %>)
+    <%- rep.contributions.nodes.each do |cont| -%>
+    - <%= pr_or_issue_link(cont.pull_request) %>
+    <%- end -%>
+  <%- end -%>
+
+  ## Reviewed Pull Requests
+  <%- organization_review_contributions.each do |rep| -%>
+  - [<%= resource_name(rep.repository.resource_path) %>](<%= github_url(rep.repository.resource_path) %>)
+    <%- rep.contributions.nodes.each do |cont| -%>
+    - <%= pr_or_issue_link(cont.pull_request) %>
+    <%- end -%>
+  <%- end -%>
+
+  ## Issues 
+  <%- organization_issue_contributions.each do |rep| -%>
+  - [<%= resource_name(rep.repository.resource_path) %>](<%= github_url(rep.repository.resource_path) %>)
+    <%- rep.contributions.nodes.each do |cont| -%>
+    - <%= pr_or_issue_link(cont.issue) %>
+    <%- end -%>
+  <%- end -%>
+
+  ## Commented Issues
+
+  <%- group_issue_comments_by_project(issue_comment_nodes).each do |(resource_path, project_name), nodes| -%>
+    <%- if resource_path -%>
+  ### [<%= project_name %>](<%= github_url(resource_path) %>)
+    <%- else -%>
+  ### <%= project_name %>
+    <%- end -%>
+
+    <%- group_issue_comments_by_repository(nodes).each do |resource_path, nodes| -%>
+  - [<%= resource_name(resource_path) %>](<%= github_url(resource_path) %>)
+    <%- nodes.each do |node| -%>
+    - <%= pr_or_issue_link(node.issue) %>
+    <%- end -%>
+    <%- end -%>
+
+  <%- end -%>
+ERB
+
+puts ERB.new(template, nil, '-').run(binding)
