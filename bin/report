@@ -263,7 +263,7 @@ organization_review_contributions = contributions_result.data.viewer.contributio
 organization_issue_contributions = contributions_result.data.viewer.contributions_collection.issue_contributions_by_repository.select { |rep| rep.repository.owner.login == organization_name }
 
 template = <<~ERB
-  ## Pull Requests
+  ## Opened Pull Requests
   <%- organization_pull_request_contributions.each do |rep| -%>
   - [<%= resource_name(rep.repository.resource_path) %>](<%= github_url(rep.repository.resource_path) %>)
     <%- rep.contributions.nodes.each do |cont| -%>
@@ -279,7 +279,7 @@ template = <<~ERB
     <%- end -%>
   <%- end -%>
 
-  ## Issues 
+  ## Opened Issues 
   <%- organization_issue_contributions.each do |rep| -%>
   - [<%= resource_name(rep.repository.resource_path) %>](<%= github_url(rep.repository.resource_path) %>)
     <%- rep.contributions.nodes.each do |cont| -%>
