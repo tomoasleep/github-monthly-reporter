@@ -16,34 +16,23 @@ require 'erb'
 require 'date'
 require 'time'
 require 'open-uri'
-require 'optparse'
 
-CmdOpt = Struct.new('CmdOpt', :mode, :from_time, :to_time, :organization_name, :github_access_token, keyword_init: true)
-CmdOpt::Value = CmdOpt.new(mode: :github)
-
-OptionParser.new do |opt|
-  opt.banner = "Usage: ruby gh-monthly-report.rb <year> <month> <organization name> [options]"
-  opt.on('--mode MODE', "Display mode in github,qiita-team (Default: github)") { |v| CmdOpt::Value.mode = v.to_sym }
-  opt.on('--github-token TOKEN', "GitHub Access Token (Default: ENV['GITHUB_ACCESS_TOKEN'])") { |v| CmdOpt::Value.github_access_token = v }
-
-  opt.parse!(ARGV)
-end
-
-CmdOpt::Value.from_time = Time.new(ARGV.fetch(0), ARGV.fetch(1))
-CmdOpt::Value.to_time = CmdOpt::Value.from_time.to_datetime.next_month.to_time
-
-CmdOpt::Value.organization_name = ARGV.fetch(2)
-CmdOpt::Value.github_access_token ||= ENV.fetch('GITHUB_ACCESS_TOKEN')
+GITHUB_ACCESS_TOKEN = ENV.fetch('GITHUB_ACCESS_TOKEN')
 
 HTTP = GraphQL::Client::HTTP.new('https://api.github.com/graphql') do
   def headers(_context)
-    { Authorization: "bearer #{CmdOpt::Value.github_access_token }" }
+    { Authorization: "bearer #{GITHUB_ACCESS_TOKEN}" }
   end
 end
 
-schema_json = URI.parse('https://api.github.com/graphql').read('Authorization' => "bearer #{CmdOpt::Value.github_access_token}")
+schema_json = URI.parse('https://api.github.com/graphql').read('Authorization' => "bearer #{GITHUB_ACCESS_TOKEN}")
 Schema = GraphQL::Client.load_schema(schema_json)
 Client = GraphQL::Client.new(schema: Schema, execute: HTTP)
+
+from_time = Time.new(ARGV.fetch(0), ARGV.fetch(1), ARGV.fetch(2))
+to_time = from_time.to_datetime.next_day.to_time
+
+organization_name = ARGV.fetch(3)
 
 class QueryError < StandardError; end
 
@@ -62,7 +51,7 @@ OrganizationQuery = Client.parse <<~'GRAPHQL'
   }
 GRAPHQL
 
-organization_result = query(OrganizationQuery, organizationName: CmdOpt::Value.organization_name)
+organization_result = query(OrganizationQuery, organizationName: organization_name)
 organization_id = organization_result.data.organization.id
 
 ContributionsQuery = Client.parse <<~'GRAPHQL'
@@ -233,9 +222,9 @@ def query_issue_comments(after:, organization_name:)
   enumerator.take_while { |node| Time.parse(node.created_at) > after }
 end
 
-contributions_result = query(ContributionsQuery, from_at: CmdOpt::Value.from_time.iso8601, to_at: CmdOpt::Value.to_time.iso8601,
+contributions_result = query(ContributionsQuery, from_at: from_time.iso8601, to_at: to_time.iso8601,
                                                  organization_id: organization_id)
-issue_comment_nodes = query_issue_comments(after: CmdOpt::Value.from_time, organization_name: CmdOpt::Value.organization_name).reverse
+issue_comment_nodes = query_issue_comments(after: from_time, organization_name: organization_name).reverse
 
 def github_url(resource_path)
   "https://github.com/#{resource_path.delete_prefix('/')}"
@@ -246,21 +235,15 @@ def resource_name(resource_path)
 end
 
 def pr_or_issue_link(resource)
-  case CmdOpt::Value.mode
-  when :github
-    github_url(resource.resource_path)
-  else
-    prefix =
-      case resource.state
-      when 'MERGED'
-        ':white_check_mark: '
-      when 'CLOSED'
-        ':white_check_mark: '
-      else
-        ':tangerine: '
-      end
-    "#{prefix}[#{resource.title} - #{resource_name(resource.repository.resource_path)}##{resource.number}](#{github_url(resource.resource_path)})"
-  end
+  prefix = case resource.state
+           when 'MERGED'
+             ':white_check_mark: '
+           when 'CLOSED'
+             ':white_check_mark: '
+           else
+             ':tangerine: '
+           end
+  "#{prefix}[#{resource.title} - #{resource_name(resource.repository.resource_path)}##{resource.number}](#{github_url(resource.resource_path)})"
 end
 
 def group_issue_comments_by_repository(nodes)
@@ -291,13 +274,13 @@ def group_issue_comments_by_project(nodes)
 end
 
 organization_pull_request_contributions = contributions_result.data.viewer.contributions_collection.pull_request_contributions_by_repository.select do |rep|
-  rep.repository.owner.login == CmdOpt::Value.organization_name
+  rep.repository.owner.login == organization_name
 end
 organization_review_contributions = contributions_result.data.viewer.contributions_collection.pull_request_review_contributions_by_repository.select do |rep|
-  rep.repository.owner.login == CmdOpt::Value.organization_name
+  rep.repository.owner.login == organization_name
 end
 organization_issue_contributions = contributions_result.data.viewer.contributions_collection.issue_contributions_by_repository.select do |rep|
-  rep.repository.owner.login == CmdOpt::Value.organization_name
+  rep.repository.owner.login == organization_name
 end
 
 template = <<~ERB
@@ -317,7 +300,7 @@ template = <<~ERB
     <%- end -%>
   <%- end -%>
 
-  ## Opened Issues
+  ## Opened Issues#{' '}
   <%- organization_issue_contributions.each do |rep| -%>
   - [<%= resource_name(rep.repository.resource_path) %>](<%= github_url(rep.repository.resource_path) %>)
     <%- rep.contributions.nodes.each do |cont| -%>
